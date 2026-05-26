@@ -1,0 +1,332 @@
+"""
+Reconocimiento de Manos con MediaPipe + OpenCV
+=============================================
+Requisitos:
+    pip install opencv-python mediapipe numpy
+
+Uso:
+    python hand_recognition.py
+
+Controles:
+    Q / ESC  → Salir
+    S        → Guardar captura de pantalla
+    M        → Mostrar/ocultar matriz completa en consola
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import sys
+
+# ──────────────────────────────────────────────
+# Configuración
+# ──────────────────────────────────────────────
+CAMARA_INDEX      = 0          # Índice de cámara (0 = default)
+ANCHO_VENTANA     = 1280
+ALTO_VENTANA      = 720
+MAX_MANOS         = 2          # Máximo de manos detectadas simultáneamente
+MIN_DETECCION     = 0.7        # Confianza mínima de detección
+MIN_SEGUIMIENTO   = 0.6        # Confianza mínima de seguimiento
+MOSTRAR_INDICES   = True       # Mostrar número de cada landmark
+MOSTRAR_MATRIZ    = True       # Mostrar matriz en pantalla
+COLOR_MANO_DER    = (0, 255, 150)   # Verde menta → mano derecha
+COLOR_MANO_IZQ    = (255, 120, 0)   # Naranja     → mano izquierda
+COLOR_TEXTO       = (255, 255, 255)
+COLOR_FONDO_HUD   = (15, 15, 30)
+
+# ──────────────────────────────────────────────
+# Nombres de los 21 landmarks de MediaPipe
+# ──────────────────────────────────────────────
+NOMBRES_LANDMARKS = [
+    "WRIST",
+    "THUMB_CMC", "THUMB_MCP", "THUMB_IP", "THUMB_TIP",
+    "INDEX_MCP",  "INDEX_PIP",  "INDEX_DIP",  "INDEX_TIP",
+    "MIDDLE_MCP", "MIDDLE_PIP", "MIDDLE_DIP", "MIDDLE_TIP",
+    "RING_MCP",   "RING_PIP",   "RING_DIP",   "RING_TIP",
+    "PINKY_MCP",  "PINKY_PIP",  "PINKY_DIP",  "PINKY_TIP",
+]
+
+# ──────────────────────────────────────────────
+# Utilidades de dibujo
+# ──────────────────────────────────────────────
+
+def texto_con_fondo(img, texto, pos, escala=0.5, grosor=1,
+                    color_texto=COLOR_TEXTO, color_fondo=(0, 0, 0), alpha=0.55):
+    """Dibuja texto con fondo semitransparente."""
+    (w, h), base = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, escala, grosor)
+    x, y = pos
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x - 2, y - h - 4), (x + w + 2, y + base + 2), color_fondo, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    cv2.putText(img, texto, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                escala, color_texto, grosor, cv2.LINE_AA)
+
+
+def dibujar_hud(img, fps, num_manos, mostrar_m):
+    """Panel de información superior izquierdo."""
+    h, w = img.shape[:2]
+    # Barra superior
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 38), COLOR_FONDO_HUD, -1)
+    cv2.addWeighted(overlay, 0.75, img, 0.25, 0, img)
+
+    cv2.putText(img, f"FPS: {fps:5.1f}", (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 220, 120), 2, cv2.LINE_AA)
+    cv2.putText(img, f"Manos: {num_manos}", (160, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 200, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, "Q/ESC=Salir  S=Guardar  M=Matriz",
+                (310, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+
+    estado_m = "ON" if mostrar_m else "OFF"
+    color_m  = (80, 220, 120) if mostrar_m else (80, 80, 120)
+    cv2.putText(img, f"[M] Matriz: {estado_m}", (w - 200, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_m, 1, cv2.LINE_AA)
+
+
+def dibujar_landmarks(img, landmarks_px, color):
+    """Dibuja puntos y conexiones de los landmarks."""
+    conexiones = mp.solutions.hands.HAND_CONNECTIONS
+    for (p1, p2) in conexiones:
+        x1, y1 = landmarks_px[p1][:2]
+        x2, y2 = landmarks_px[p2][:2]
+        cv2.line(img, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+    for i, (x, y, _) in enumerate(landmarks_px):
+        # Punto exterior (blanco)
+        cv2.circle(img, (x, y), 6, (255, 255, 255), -1, cv2.LINE_AA)
+        # Punto interior (color de la mano)
+        cv2.circle(img, (x, y), 4, color, -1, cv2.LINE_AA)
+
+        if MOSTRAR_INDICES:
+            texto_con_fondo(img, str(i), (x + 7, y - 5),
+                            escala=0.38, grosor=1,
+                            color_texto=(230, 230, 230),
+                            color_fondo=(20, 20, 20))
+
+
+def dibujar_matriz(img, landmarks_norm, label, color, offset_y=50):
+    """
+    Dibuja la matriz de coordenadas normalizada en pantalla.
+    Columnas: ID | Nombre | X | Y | Z
+    """
+    h, w = img.shape[:2]
+    col_w   = [30, 135, 75, 75, 75]          # anchos de columna
+    fila_h  = 18
+    margen_x = w - sum(col_w) - 20
+    encabezados = ["ID", "LANDMARK", "  X", "  Y", "  Z"]
+
+    # Fondo de la tabla
+    tabla_h = (len(landmarks_norm) + 2) * fila_h + 10
+    overlay = img.copy()
+    cv2.rectangle(overlay,
+                  (margen_x - 8, offset_y - 22),
+                  (w - 8, offset_y + tabla_h),
+                  (10, 10, 25), -1)
+    cv2.addWeighted(overlay, 0.80, img, 0.20, 0, img)
+
+    # Título
+    cv2.putText(img, f"[{label}] Matriz Landmarks (norm)",
+                (margen_x, offset_y - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    # Encabezado
+    x_cursor = margen_x
+    for k, enc in enumerate(encabezados):
+        cv2.putText(img, enc, (x_cursor, offset_y + fila_h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                    (200, 200, 60), 1, cv2.LINE_AA)
+        x_cursor += col_w[k]
+
+    # Línea separadora
+    cv2.line(img,
+             (margen_x, offset_y + fila_h + 3),
+             (w - 10, offset_y + fila_h + 3),
+             (80, 80, 120), 1)
+
+    # Filas de datos
+    for i, lm in enumerate(landmarks_norm):
+        y_fila = offset_y + (i + 2) * fila_h + 4
+        valores = [str(i), NOMBRES_LANDMARKS[i],
+                   f"{lm.x:+.4f}", f"{lm.y:+.4f}", f"{lm.z:+.4f}"]
+        x_cursor = margen_x
+        for k, val in enumerate(valores):
+            color_val = (200, 200, 200) if k < 2 else (100, 220, 180)
+            cv2.putText(img, val, (x_cursor, y_fila),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        color_val, 1, cv2.LINE_AA)
+            x_cursor += col_w[k]
+
+
+def imprimir_matriz_consola(landmarks_norm, label):
+    """Imprime la matriz formateada en la terminal."""
+    sep = "─" * 62
+    print(f"\n{'═'*62}")
+    print(f"  MANO: {label}")
+    print(sep)
+    print(f"  {'ID':>3}  {'LANDMARK':<15}  {'X':>9}  {'Y':>9}  {'Z':>9}")
+    print(sep)
+    for i, lm in enumerate(landmarks_norm):
+        print(f"  {i:>3}  {NOMBRES_LANDMARKS[i]:<15}  "
+              f"{lm.x:>+9.6f}  {lm.y:>+9.6f}  {lm.z:>+9.6f}")
+    print(sep)
+
+
+def estimar_gesto(landmarks_px, h, w):
+    """Estimación básica de gesto (pulgar arriba/abajo, mano abierta, puño)."""
+    tips   = [4, 8, 12, 16, 20]   # puntas de dedos
+    bases  = [3, 6, 10, 14, 18]   # articulaciones base
+
+    dedos_extendidos = 0
+    for tip, base in zip(tips[1:], bases[1:]):   # dedos 2-5
+        if landmarks_px[tip][1] < landmarks_px[base][1]:
+            dedos_extendidos += 1
+
+    # Pulgar (comparación horizontal en lugar de vertical)
+    if landmarks_px[4][0] > landmarks_px[3][0]:
+        dedos_extendidos += 1
+
+    if dedos_extendidos == 5:
+        return "Mano Abierta ✋"
+    elif dedos_extendidos == 0:
+        return "Puño ✊"
+    elif dedos_extendidos == 1 and landmarks_px[4][1] < landmarks_px[3][1]:
+        return "Pulgar Arriba 👍"
+    elif dedos_extendidos == 2:
+        return "Dos dedos ✌️"
+    else:
+        return f"{dedos_extendidos} dedos"
+
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+
+def main():
+    mp_hands   = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils  # (no usado directamente, pero útil)
+
+    cap = cv2.VideoCapture(CAMARA_INDEX)
+    if not cap.isOpened():
+        print(f"[ERROR] No se pudo abrir la cámara (índice {CAMARA_INDEX}).")
+        sys.exit(1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  ANCHO_VENTANA)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTO_VENTANA)
+
+    print("=" * 55)
+    print("  Reconocimiento de Manos  — MediaPipe + OpenCV")
+    print("  Q / ESC → Salir")
+    print("  S       → Guardar captura")
+    print("  M       → Imprimir matriz en consola")
+    print("=" * 55)
+
+    mostrar_matriz_pantalla = MOSTRAR_MATRIZ
+    prev_time  = time.time()
+    fps        = 0.0
+    capturas   = 0
+
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=MAX_MANOS,
+        min_detection_confidence=MIN_DETECCION,
+        min_tracking_confidence=MIN_SEGUIMIENTO,
+    )
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] No se recibió frame. Reintentando...")
+            continue
+
+        # Voltear horizontalmente (efecto espejo)
+        frame = cv2.flip(frame, 1)
+        h, w  = frame.shape[:2]
+
+        # Convertir a RGB para MediaPipe
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = hands.process(rgb)
+        rgb.flags.writeable = True
+
+        num_manos = 0
+
+        if results.multi_hand_landmarks:
+            num_manos = len(results.multi_hand_landmarks)
+
+            for idx, (hand_lms, hand_info) in enumerate(
+                    zip(results.multi_hand_landmarks,
+                        results.multi_handedness)):
+
+                label = hand_info.classification[0].label   # "Left" / "Right"
+                score = hand_info.classification[0].score
+                color = COLOR_MANO_DER if label == "Right" else COLOR_MANO_IZQ
+
+                # Landmarks en píxeles
+                landmarks_px = []
+                for lm in hand_lms.landmark:
+                    cx = int(lm.x * w)
+                    cy = int(lm.y * h)
+                    cz = int(lm.z * w)   # z está en escala relativa al ancho
+                    landmarks_px.append((cx, cy, cz))
+
+                # ── Dibujar esqueleto
+                dibujar_landmarks(frame, landmarks_px, color)
+
+                # ── Bounding box
+                xs = [p[0] for p in landmarks_px]
+                ys = [p[1] for p in landmarks_px]
+                x1, y1 = max(min(xs) - 20, 0), max(min(ys) - 20, 0)
+                x2, y2 = min(max(xs) + 20, w), min(max(ys) + 20, h)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+
+                # ── Etiqueta de mano + gesto
+                gesto = estimar_gesto(landmarks_px, h, w)
+                etiqueta = f"{label}  {score:.0%}  |  {gesto}"
+                texto_con_fondo(frame, etiqueta, (x1, y1 - 8),
+                                escala=0.55, grosor=1,
+                                color_texto=color,
+                                color_fondo=(10, 10, 20))
+
+                # ── Matriz en pantalla
+                if mostrar_matriz_pantalla:
+                    offset = 50 + idx * (21 * 18 + 50)
+                    dibujar_matriz(frame, hand_lms.landmark,
+                                   f"{label} ({score:.0%})", color, offset_y=offset)
+
+        # ── HUD
+        curr_time = time.time()
+        fps = 0.9 * fps + 0.1 * (1.0 / max(curr_time - prev_time, 1e-6))
+        prev_time = curr_time
+        dibujar_hud(frame, fps, num_manos, mostrar_matriz_pantalla)
+
+        # ── Mostrar
+        cv2.imshow("Reconocimiento de Manos — Hand Tracking", frame)
+
+        # ── Teclas
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):          # Q o ESC
+            break
+        elif key == ord('s'):              # Guardar captura
+            capturas += 1
+            nombre = f"captura_{capturas:03d}.png"
+            cv2.imwrite(nombre, frame)
+            print(f"[INFO] Captura guardada: {nombre}")
+        elif key == ord('m'):              # Imprimir / toggle matriz
+            mostrar_matriz_pantalla = not mostrar_matriz_pantalla
+            if results and results.multi_hand_landmarks:
+                for idx, (hand_lms, hand_info) in enumerate(
+                        zip(results.multi_hand_landmarks,
+                            results.multi_handedness)):
+                    label = hand_info.classification[0].label
+                    imprimir_matriz_consola(hand_lms.landmark, label)
+
+    # ── Limpieza
+    hands.close()
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\n[INFO] Sesión finalizada.")
+
+
+if __name__ == "__main__":
+    main()
